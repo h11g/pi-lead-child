@@ -725,10 +725,12 @@ export class ChannelHub {
   // 读不了库时按「不是」处理（照常问）。
   private recordOnly(adapter: ChannelAdapter, item: ChannelInbound): boolean {
     try {
-      if (item.amends && !getOpenChannelCard(this.db, item.objectKey)) return true;
+      // 助手按占位判断过不用回、现在正文变了的编辑（reopenOf）和新消息一样问紧急程度，按原来那条消息的类型定投递。
+      const reopen = this.reopenOf(adapter.id, item);
+      if (item.amends && reopen === null && !getOpenChannelCard(this.db, item.objectKey)) return true;
       const payload = { ...item.fields, role: item.role, sender: { ...item.sender }, text: item.text, urgent: true };
       return channelDeliveryDecision(channelDeliveryPolicy(this.db, adapter.id), {
-        source: adapter.id, kind: item.kind, entityKey: item.objectKey, payload, rootCause: null,
+        source: adapter.id, kind: reopen?.kind ?? item.kind, entityKey: item.objectKey, payload, rootCause: null,
       }).mode === "record";
     } catch (error) {
       this.log(`[channels] ${adapter.id}: could not read the delivery policy: ${errorText(error)}`);
@@ -782,13 +784,13 @@ export class ChannelHub {
     };
     // 别人发来的消息：先定投递方式，写进事件的 channelDelivery。摘要投递的消息由 06 的「Lead 动态」卡片显示；
     // 会话卡、推送加会话卡的有自己的卡，只记录的不显示：「Lead 动态」不再说一遍（store 的 listLeadActivityEvents）。
+    // 助手按占位判断过「不用回」、后来改成了正文：当作新消息再判断一次（reopenOf），投递方式按原来那条消息的类型定。
+    const reopen = item.role === "message" ? this.reopenOf(adapter.id, item) : null;
     let decision = item.role === "message"
       ? channelDeliveryDecision(channelDeliveryPolicy(db, adapter.id), {
-        source: adapter.id, kind: item.kind, entityKey: item.objectKey, payload, rootCause: null,
+        source: adapter.id, kind: reopen?.kind ?? item.kind, entityKey: item.objectKey, payload, rootCause: null,
       })
       : null;
-    // 助手按占位判断过「不用回」、后来改成了正文：当作新消息再判断一次（reopenOf）。
-    const reopen = decision ? this.reopenOf(adapter.id, item) : null;
     // 改消息、删消息只更新没结束的卡：这个对话没有这样的卡时只记录，不为它开新卡。
     if (decision && item.amends && reopen === null && decision.mode !== "record" && !getOpenChannelCard(db, item.objectKey)) {
       decision = { ...decision, mode: "record" };
@@ -800,7 +802,7 @@ export class ChannelHub {
     if (item.amends) payload.amends = item.amends;
     if (merge) payload.editMerge = merge.kind;
     // reopen 让常设指令 slack.amendment 不把它压成 record；editMerge 让它成为这条消息新的判断头（editMergeFor），之后的编辑并进来。
-    if (reopen !== null) Object.assign(payload, { reopen: true, reopenOf: reopen, editMerge: "rejudge" });
+    if (reopen !== null) Object.assign(payload, { reopen: true, reopenOf: reopen.seq, reopenKind: reopen.kind, editMerge: "rejudge" });
     if (decision) payload.channelDelivery = decision.mode;
     if (followOnly) payload.channelDelivery = "record";
     // 要开新卡的消息：有快模型时先不开，等请求 A 判断要不要用户回（用户 2026-10-21）。开卡要用的东西先记在事件里，
@@ -941,10 +943,10 @@ export class ChannelHub {
 
   /**
    * 一次编辑要不要当新消息再判断：助手按旧的话判断过「不用回」（没开卡、没交给 Lead），现在话变了一大半，
-   * 用户没有在这个对话里回复过，这条消息重开不到 REOPEN_LIMIT 次，编辑是新的。返回被改的那条判断的事件编号，不重开时是 null。
+   * 用户没有在这个对话里回复过，这条消息重开不到 REOPEN_LIMIT 次，编辑是新的。返回被改的那条判断的事件编号和最早那条消息的类型，不重开时是 null。
    * 用户点了忽略、Lead 处理过的消息处置不是助手的 no_action，不会重开；这个对话有开着的卡时编辑照旧更新卡。
    */
-  private reopenOf(source: string, item: ChannelInbound): number | null {
+  private reopenOf(source: string, item: ChannelInbound): { seq: number; kind: string } | null {
     if (item.amends !== "edited" || item.role !== "message" || !item.messageId) return null;
     try {
       if (getOpenChannelCard(this.db, item.objectKey)) return null;
@@ -962,7 +964,9 @@ export class ChannelHub {
         `SELECT COUNT(*) AS n FROM events WHERE source = ? AND entity_key = ? AND json_valid(payload)
            AND json_extract(payload, '$.messageId') = ? AND json_extract(payload, '$.reopen') = 1`,
       ).get(source, item.objectKey, item.messageId) as { n: number };
-      return n < REOPEN_LIMIT ? head.seq : null;
+      // 再次重开时，头是上一次重开的编辑：类型还是最早那条消息的（reopenKind）。
+      const kind = typeof head.payload.reopenKind === "string" ? head.payload.reopenKind : head.kind;
+      return n < REOPEN_LIMIT ? { seq: head.seq, kind } : null;
     } catch (error) {
       this.log(`[channels] ${source}: could not tell whether to judge an edit in ${item.objectKey} again: ${errorText(error)}`);
       return null;
@@ -3768,9 +3772,9 @@ export class ChannelHub {
     } catch (error) {
       this.log(`[channels] could not read the business map: ${errorText(error)}`);
     }
-    const result = await judgeChannelIntake({
+    const judge = (judged: string) => judgeChannelIntake({
       intake: {
-        text,
+        text: judged,
         recent: recentForIntake(lane?.context ?? [], seq),
         senderTrust: trust,
         laneLabel: lane?.label ?? objectKey,
@@ -3783,6 +3787,16 @@ export class ChannelHub {
       timeoutMs: Math.max(this.options.intakeTimeoutMs ?? CHANNEL_INTAKE_TIMEOUT_MS, 1),
       text: this.textModelNow(),
     });
+    let judged = this.mergedMessage(adapter.id, event).text || text;
+    let result = await judge(judged);
+    // 判断的时候对方把消息改了（editMergeFor 记成 merge_pending）：占位变成正文时，按旧的话判的「不用回」不能作数。
+    // 实质变了就按最新的话再判断，直到判断完时话不再变（最多 REOPEN_LIMIT 轮）；改错字不重判。
+    for (let round = 0; round < REOPEN_LIMIT; round += 1) {
+      const latest = this.mergedMessage(adapter.id, event).text;
+      if (!latest || !materialEdit(judged, latest)) break;
+      judged = latest;
+      result = await judge(judged);
+    }
     const at = this.now();
     const payload = {
       channel: adapter.id, cardId: card?.id ?? null, forSeq: seq, status: result.status, situation: result.situation, askKind: result.askKind,
