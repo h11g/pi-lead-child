@@ -109,7 +109,7 @@ import {
   buildContextPack, contextParts, repackForText, type BuiltContextPack, type ContextPackDeps, type ContextPackInput, type ContextPackOptions,
 } from "./context-pack.js";
 import {
-  editMergeOf, externalMessageEvent, materialEdit, mergeEdit, messageCeiling, REOPEN_LIMIT, REOPEN_MAX_AGE_MS, type EditMerge,
+  editMergeOf, externalMessageEvent, mergeEdit, messageCeiling, placeholderBecameText, REOPEN_MAX_AGE_MS, type EditMerge,
 } from "./inbound.js";
 import { decideByHandbook, type HandbookDecision } from "./handbook-decision.js";
 import { handbookDecisionFor } from "./handbook-suggestions.js";
@@ -942,8 +942,8 @@ export class ChannelHub {
   }
 
   /**
-   * 一次编辑要不要当新消息再判断：助手按旧的话判断过「不用回」（没开卡、没交给 Lead），现在话变了一大半，
-   * 用户没有在这个对话里回复过，这条消息重开不到 REOPEN_LIMIT 次，编辑是新的。返回被改的那条判断的事件编号和最早那条消息的类型，不重开时是 null。
+   * 一次编辑要不要当新消息再判断：助手按占位判断过「不用回」（没开卡、没交给 Lead），现在占位变成了正文（placeholderBecameText），
+   * 用户没有在这个对话里回复过，编辑是新的。普通消息的实质修改不重开。返回被改的那条判断的事件编号和最早那条消息的类型，不重开时是 null。
    * 用户点了忽略、Lead 处理过的消息处置不是助手的 no_action，不会重开；这个对话有开着的卡时编辑照旧更新卡。
    */
   private reopenOf(source: string, item: ChannelInbound): { seq: number; kind: string } | null {
@@ -954,19 +954,15 @@ export class ChannelHub {
       const seq = this.judgedHeadSeq(source, item);
       const head = seq === undefined ? undefined : getEvent(this.db, seq);
       if (!head || head.disposition !== "no_action" || head.dispositionDetail?.by !== "assistant") return null;
-      if (!materialEdit(typeof head.payload.text === "string" ? head.payload.text : "", item.text)) return null;
+      if (!placeholderBecameText(typeof head.payload.text === "string" ? head.payload.text : "", item.text)) return null;
       const answered = this.db.prepare(
         `SELECT 1 FROM events WHERE source = ? AND entity_key = ? AND seq > ? AND json_valid(payload)
            AND json_extract(payload, '$.role') IN ('self_reply', 'echo') LIMIT 1`,
       ).get(source, item.objectKey, head.seq);
       if (answered) return null;
-      const { n } = this.db.prepare(
-        `SELECT COUNT(*) AS n FROM events WHERE source = ? AND entity_key = ? AND json_valid(payload)
-           AND json_extract(payload, '$.messageId') = ? AND json_extract(payload, '$.reopen') = 1`,
-      ).get(source, item.objectKey, item.messageId) as { n: number };
-      // 再次重开时，头是上一次重开的编辑：类型还是最早那条消息的（reopenKind）。
+      // 头是上一次重开的编辑时，类型还是最早那条消息的（reopenKind）。
       const kind = typeof head.payload.reopenKind === "string" ? head.payload.reopenKind : head.kind;
-      return n < REOPEN_LIMIT ? { seq: head.seq, kind } : null;
+      return { seq: head.seq, kind };
     } catch (error) {
       this.log(`[channels] ${source}: could not tell whether to judge an edit in ${item.objectKey} again: ${errorText(error)}`);
       return null;
@@ -3789,11 +3785,10 @@ export class ChannelHub {
     });
     let judged = this.mergedMessage(adapter.id, event).text || text;
     let result = await judge(judged);
-    // 判断的时候对方把消息改了（editMergeFor 记成 merge_pending）：占位变成正文时，按旧的话判的「不用回」不能作数。
-    // 实质变了就按最新的话再判断，直到判断完时话不再变（最多 REOPEN_LIMIT 轮）；改错字不重判。
-    for (let round = 0; round < REOPEN_LIMIT; round += 1) {
-      const latest = this.mergedMessage(adapter.id, event).text;
-      if (!latest || !materialEdit(judged, latest)) break;
+    // 判断的时候对方把占位改成了正文（editMergeFor 记成 merge_pending）：按占位判的「不用回」不能作数，按最新的话再判断一次。
+    // 普通消息的修改、占位换成另一个占位不重判。
+    const latest = this.mergedMessage(adapter.id, event).text;
+    if (latest && placeholderBecameText(judged, latest)) {
       judged = latest;
       result = await judge(judged);
     }

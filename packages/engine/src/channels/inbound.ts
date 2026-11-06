@@ -111,15 +111,23 @@ export function mergeEdit(queued: MessageReceivedPayload, edit: { seq: number; t
   return { ...queued, text: edit.text, messages, edits: queued.edits + 1 };
 }
 
-/** 一条消息最多重开几次（reopenOf）：连续刷新的占位消息不会让每次编辑都问一遍 Jev。 */
-export const REOPEN_LIMIT = 3;
 /** 重开只对新鲜的编辑：补拉到的历史编辑不重开，免得旧数据变成一批新卡。 */
 export const REOPEN_MAX_AGE_MS = 60 * 60_000;
+/** 占位消息都很短：超过这个长度的话不当占位（认不出时保守，不重开）。 */
+const PLACEHOLDER_MAX_CHARS = 200;
+// 结尾是省略号（可以跟着 emoji 短代码，例如「… :hourglass:」）。
+const TRAILING_ELLIPSIS = /(?:…|⋯|\.{3,}|。{3,})(?:\s|:[a-z0-9_+-]+:)*$/i;
 
 /**
- * 改动是不是大到要重新判断（决策边界，纯函数）。判断「不用回」是按旧的话做的；占位变正文，长度或内容变了一大半。
- * 改错字、补几个字不算：开头和结尾没变的部分还占旧的话的一半以上，长度也没怎么变。
+ * 这句话是不是占位（「正在看…」「Thinking...」）：短，并且以省略号结尾，表示正文还在路上。
+ * 不看具体的词，认不出的话一律不算占位。
  */
+export function isPlaceholderText(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.length > 0 && trimmed.length <= PLACEHOLDER_MAX_CHARS && TRAILING_ELLIPSIS.test(trimmed);
+}
+
+/** 改动是不是大到要重新判断（决策边界，纯函数）：长度变化大，或者开头和结尾没变的部分不到旧的话的一半。改错字不算。 */
 export function materialEdit(previous: string, next: string): boolean {
   const before = previous.trim();
   const after = next.trim();
@@ -130,6 +138,14 @@ export function materialEdit(previous: string, next: string): boolean {
   let tail = 0;
   while (tail < limit - head && before[before.length - 1 - tail] === after[after.length - 1 - tail]) tail += 1;
   return head + tail < before.length / 2;
+}
+
+/**
+ * 占位变成了正文（决策边界，纯函数）：判断「不用回」时的话是占位，现在的话不再是占位，并且实质变了。
+ * 占位换成另一个占位（进度更新）、普通消息的实质修改都不算：它们的编辑照旧只记录（维护者规则 1）。
+ */
+export function placeholderBecameText(judged: string, latest: string): boolean {
+  return isPlaceholderText(judged) && !isPlaceholderText(latest) && materialEdit(judged, latest);
 }
 
 /**

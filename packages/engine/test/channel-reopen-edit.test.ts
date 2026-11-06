@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { tempDir } from "@pi-lead-child/core/testing";
 import { getChannelCard, getEvent, listChannelCardsForObject, listEvents, openDb, type Db } from "@pi-lead-child/store";
 import { MESSAGE_EVENT_KIND } from "@pi-lead-child/protocol";
-import { ChannelHub, ChannelRegistry, createSlackChannelAdapter, type SmartModel } from "../src/index.js";
+import { ChannelHub, ChannelRegistry, createSlackChannelAdapter, isPlaceholderText, placeholderBecameText, type SmartModel } from "../src/index.js";
 import { cardIdOf, FakeAgentTaskDispatcher, FakeSlack, scriptedSmartModel } from "../testing/index.js";
 
 let db: Db;
@@ -96,20 +96,56 @@ describe("an edit that turns a no-reply placeholder into the real text", () => {
     expect(listChannelCardsForObject(db, edited.objectKey)).toHaveLength(1);
   });
 
-  it("judges once per edit, keeps one card, and stops after three reopenings of the same message", async () => {
+  it("reopens a message once: edits after the real text was judged again are only recorded", async () => {
     const { hub } = setup(() => 0.05);
     const dm = slack.dm("U0FAIRY", PLACEHOLDER);
     const head = (await hub.receive("slack", dm)).items[0]!;
     await hub.idle();
-    const versions = ["alpha ".repeat(20), "bravo ".repeat(20), "charlie ".repeat(20), "delta ".repeat(20)];
-    for (const text of versions) {
+    for (const text of ["alpha ".repeat(20), "bravo ".repeat(20), "charlie ".repeat(20)]) {
       await hub.receive("slack", slack.edit(dm, text));
       await hub.idle();
     }
     const reopened = listEvents(db, { kind: "slack.message.edited" }).filter((event) => event.payload.reopen === true);
-    expect(reopened).toHaveLength(3);
-    expect(reopened.map((event) => event.payload.reopenOf)).toEqual([head.seq, reopened[0]!.seq, reopened[1]!.seq]);
+    expect(reopened.map((event) => event.payload.reopenOf)).toEqual([head.seq]);
     expect(listChannelCardsForObject(db, head.objectKey)).toEqual([]);
+  });
+
+  it.each([
+    ["Thinking...", "Thinking... "],
+    ["Working on it… :hourglass:", "Working on it…"],
+  ])("recognises %j as a placeholder, not only one fixed sentence", async (placeholder) => {
+    const { hub } = setup((first) => (isPlaceholderText(first) ? 0.05 : 0.9));
+    const dm = slack.dm("U0FAIRY", placeholder);
+    await hub.receive("slack", dm);
+    await hub.idle();
+    const edited = (await hub.receive("slack", slack.edit(dm, BODY))).items[0]!;
+    await hub.idle();
+    expect(getChannelCard(db, cardIdOf(db, edited)!)).toMatchObject({ state: "open" });
+  });
+
+  it("does not reopen an ordinary message whose edit is a big change, which stays recorded only", async () => {
+    const { hub, model } = setup(() => 0.05);
+    const dm = slack.dm("U0FAIRY", "各种连招好多。我等客户端它们优化好了。弄不动了 :facepalm:");
+    await hub.receive("slack", dm);
+    await hub.idle();
+    const calls = model.calls.length;
+    const edited = (await hub.receive("slack", slack.edit(dm, "今天先到这里，另外能帮我看一下 #123 的 CI 为什么挂了吗？日志在构建页面上，我这边复现不了，麻烦今天内回复我。"))).items[0]!;
+    await hub.idle();
+    expect(edited).toMatchObject({ delivery: "record", cardId: null });
+    expect(listChannelCardsForObject(db, edited.objectKey)).toEqual([]);
+    expect(model.calls.length).toBe(calls);
+  });
+
+  it("does not reopen when a placeholder is only replaced by another placeholder", async () => {
+    const { hub, model } = setup(() => 0.05);
+    const dm = slack.dm("U0FAIRY", PLACEHOLDER);
+    await hub.receive("slack", dm);
+    await hub.idle();
+    const calls = model.calls.length;
+    const edited = (await hub.receive("slack", slack.edit(dm, ":robot: Review bot is reviewing the 3 changed files and the lockfile, about half way…"))).items[0]!;
+    await hub.idle();
+    expect(edited).toMatchObject({ delivery: "record", cardId: null });
+    expect(model.calls.length).toBe(calls);
   });
 
   it("leaves a deleted message alone", async () => {
@@ -189,6 +225,17 @@ describe("an edit that arrives while the first judgement is still running", () =
     expect(intakeCalls(model)).toBe(1);
   });
 
+  it("does not judge an ordinary message again for a big edit made while it is judged", async () => {
+    const { hub, model, release } = leadHub({ hold: true });
+    const dm = slack.dm("U0FAIRY", "各种连招好多。我等客户端它们优化好了。弄不动了 :facepalm:");
+    await hub.receive("slack", dm);
+    await expect.poll(() => intakeCalls(model)).toBe(1);
+    await hub.receive("slack", slack.edit(dm, "今天先到这里，明天上午十点我们在会议室继续讨论发布计划，请大家提前把各自负责模块的风险整理好发在群里。"));
+    release();
+    await hub.idle();
+    expect(intakeCalls(model)).toBe(1);
+  });
+
   it("does not open a second card or send Lead a second message when Slack delivers the same edit again", async () => {
     const { hub, release } = leadHub({ hold: true });
     const dm = slack.dm("U0FAIRY", PLACEHOLDER);
@@ -229,5 +276,30 @@ describe("an edit that reopens a skipped message follows the normal delivery and
     await hub.idle();
     expect(edited.delivery).toBe("card");
     expect(pushes).toEqual([]);
+  });
+});
+
+describe("how a placeholder is told from a text (inbound.ts, the decision boundary)", () => {
+  it.each([
+    ["Fairy is reviewing…", true],
+    ["Thinking...", true],
+    ["Working on it… :hourglass:", true],
+    ["正在处理中……", true],
+    ["谢谢", false],
+    ["Please review… when you have time, the link is below", false],
+    ["", false],
+    [`${"long ".repeat(60)}…`, false],
+  ])("isPlaceholderText(%j) is %s", (text, expected) => {
+    expect(isPlaceholderText(text)).toBe(expected);
+  });
+
+  it.each([
+    ["Fairy is reviewing…", BODY, true],
+    ["Fairy is reviewing…", "Fairy is reviewing the files, half way…", false],
+    ["Fairy is reviewing…", "Fairy is reviewing", false],
+    ["谢谢", "谢谢，另外能帮我看一下 CI 吗？日志在构建页面上，我这边复现不了。", false],
+    ["Thinking...", "Thinking... ok", false],
+  ])("placeholderBecameText(%j -> %j) is %s", (judged, latest, expected) => {
+    expect(placeholderBecameText(judged, latest)).toBe(expected);
   });
 });

@@ -1,5 +1,6 @@
 // 通道的常设指令（工单 11）：来源插件的种子（打断阈值、投递）、改它们的档位（工单 10 的三档），以及授权表
 // （channel.authority，落地计划 A5）的放开只算系统种子、用户写的、或者用户批准过的版本。
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { tempDir } from "@pi-lead-child/core/testing";
@@ -165,5 +166,30 @@ describe("the authority table that really applies", () => {
       requested: { meeting: { action: "auto" }, secret: { action: "auto" } },
     });
     seeded.close();
+  });
+});
+
+// 来源插件的种子和内置种子一样：改了内容却忘了加修订号，已有的库永远收不到这次修改（同步只看修订号）。
+// store 的 standing-orders.test.ts 只钉内置种子，这里钉 Slack 插件的：内容变了，这个测试失败；
+// 改的人把修订号加 1，再把这里的值改成新的「修订号:指纹」。
+describe("the slack plugin's seeds are pinned to their revision", () => {
+  it("fails when a seed's content changes without a new revision", () => {
+    const stable = (value: unknown): string => Array.isArray(value) ? `[${value.map(stable).join(",")}]`
+      : value && typeof value === "object"
+        ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable((value as Record<string, unknown>)[key])}`).join(",")}}`
+        : JSON.stringify(value ?? null);
+    const fingerprints = Object.fromEntries(slackAdapter.standingOrders.map(({ seedRevision, ...content }) =>
+      [content.id, `${seedRevision}:${createHash("sha256").update(stable(content)).digest("hex").slice(0, 12)}`]));
+    expect(fingerprints).toEqual({
+      "channel.slack.delegate": "2:b5b8efd00f1e",
+      "channel.slack.delivery": "4:3d396653a3b5",
+      "channel.slack.lookup": "2:45ea7faf5d0d",
+      "channel.slack.reply": "3:8f9efa82d142",
+      "slack.amendment": "2:c81122fe5be4",
+      "slack.channel_message": "1:bd5361bb349e",
+      "slack.record_only": "1:9ef976114b9d",
+      "slack.self_reply": "1:c1ea9aa02720",
+      "source.slack": "1:3261e5d94c4c",
+    });
   });
 });
