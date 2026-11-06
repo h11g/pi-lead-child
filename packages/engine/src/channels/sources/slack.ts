@@ -430,15 +430,17 @@ const SEEDS: readonly SystemStandingOrderSeed[] = [
   },
   {
     id: "slack.amendment",
-    seedRevision: 1,
+    // 2：助手按占位判断过不用回、后来改成正文的编辑（payload.reopen）不压成 record，按 channel.slack.delivery 正常定级。
+    seedRevision: 2,
     title: "Slack 里改消息、删消息只记录（这个对话有没结束的卡时，卡照样更新）",
     priority: 90,
-    condition: { kinds: [SLACK_EVENT_KINDS.edited, SLACK_EVENT_KINDS.deleted] },
+    condition: { kinds: [SLACK_EVENT_KINDS.edited, SLACK_EVENT_KINDS.deleted], fields: { "payload.reopen": { not: true } } },
     action: { type: "level", level: "record" },
     limits: null,
     escalateTo: null,
     reason: "slack-takeover 工单 02：改和删只对已有的道。没结束的卡上看得到（摘录换成新的，闸门重新判断），不用为它叫醒 Lead；"
-      + "没有没结束的卡时不开新卡。",
+      + "没有没结束的卡时不开新卡。"
+      + "例外：助手按占位判断过不用回、后来改成正文的编辑（hub 的 reopenOf）当新消息再判断，不在这里压成 record。",
   },
   {
     id: "channel.slack.delivery",

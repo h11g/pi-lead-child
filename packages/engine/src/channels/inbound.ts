@@ -111,6 +111,27 @@ export function mergeEdit(queued: MessageReceivedPayload, edit: { seq: number; t
   return { ...queued, text: edit.text, messages, edits: queued.edits + 1 };
 }
 
+/** 一条消息最多重开几次（reopenOf）：连续刷新的占位消息不会让每次编辑都问一遍 Jev。 */
+export const REOPEN_LIMIT = 3;
+/** 重开只对新鲜的编辑：补拉到的历史编辑不重开，免得旧数据变成一批新卡。 */
+export const REOPEN_MAX_AGE_MS = 60 * 60_000;
+
+/**
+ * 改动是不是大到要重新判断（决策边界，纯函数）。判断「不用回」是按旧的话做的；占位变正文，长度或内容变了一大半。
+ * 改错字、补几个字不算：开头和结尾没变的部分还占旧的话的一半以上，长度也没怎么变。
+ */
+export function materialEdit(previous: string, next: string): boolean {
+  const before = previous.trim();
+  const after = next.trim();
+  if (Math.abs(after.length - before.length) >= Math.max(20, before.length / 2)) return true;
+  const limit = Math.min(before.length, after.length);
+  let head = 0;
+  while (head < limit && before[head] === after[head]) head += 1;
+  let tail = 0;
+  while (tail < limit - head && before[before.length - 1 - tail] === after[after.length - 1 - tail]) tail += 1;
+  return head + tail < before.length / 2;
+}
+
 /**
  * 对方改了一条消息（spec D6），入站层怎么处理（决策边界，纯函数）：
  *   merge_pending：这条消息还在入站判断里（Jev 还没回答），还没有它的消息事件：只记录，产生消息事件时用改后的话。
