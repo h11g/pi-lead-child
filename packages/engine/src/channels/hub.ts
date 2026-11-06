@@ -108,7 +108,9 @@ import {
 import {
   buildContextPack, contextParts, repackForText, type BuiltContextPack, type ContextPackDeps, type ContextPackInput, type ContextPackOptions,
 } from "./context-pack.js";
-import { editMergeOf, externalMessageEvent, mergeEdit, messageCeiling, type EditMerge } from "./inbound.js";
+import {
+  editMergeOf, externalMessageEvent, materialEdit, mergeEdit, messageCeiling, REOPEN_LIMIT, REOPEN_MAX_AGE_MS, type EditMerge,
+} from "./inbound.js";
 import { decideByHandbook, type HandbookDecision } from "./handbook-decision.js";
 import { handbookDecisionFor } from "./handbook-suggestions.js";
 import {
@@ -785,8 +787,10 @@ export class ChannelHub {
         source: adapter.id, kind: item.kind, entityKey: item.objectKey, payload, rootCause: null,
       })
       : null;
+    // 助手按占位判断过「不用回」、后来改成了正文：当作新消息再判断一次（reopenOf）。
+    const reopen = decision ? this.reopenOf(adapter.id, item) : null;
     // 改消息、删消息只更新没结束的卡：这个对话没有这样的卡时只记录，不为它开新卡。
-    if (decision && item.amends && decision.mode !== "record" && !getOpenChannelCard(db, item.objectKey)) {
+    if (decision && item.amends && reopen === null && decision.mode !== "record" && !getOpenChannelCard(db, item.objectKey)) {
       decision = { ...decision, mode: "record" };
     }
     // 合并编辑（统一消息事件 spec D6，inbound.ts）：交给 Lead 时，Lead 拿走以前对方改的消息并进那条消息，不再问一次请求 A，
@@ -795,12 +799,14 @@ export class ChannelHub {
     if (decision && merge && merge.kind !== "rejudge") decision = { ...decision, mode: "record" };
     if (item.amends) payload.amends = item.amends;
     if (merge) payload.editMerge = merge.kind;
+    // reopen 让常设指令 slack.amendment 不把它压成 record；editMerge 让它成为这条消息新的判断头（editMergeFor），之后的编辑并进来。
+    if (reopen !== null) Object.assign(payload, { reopen: true, reopenOf: reopen, editMerge: "rejudge" });
     if (decision) payload.channelDelivery = decision.mode;
     if (followOnly) payload.channelDelivery = "record";
     // 要开新卡的消息：有快模型时先不开，等请求 A 判断要不要用户回（用户 2026-10-21）。开卡要用的东西先记在事件里，
     // 判断丢了（例如 daemon 重启）时每一拍按它补上（settleStalePendingCards）。这个对话已经有没结束的卡时照旧并进去。
     const deferCard = decision !== null && (decision.mode === "card" || decision.mode === "push_card") && adapter.kind === "conversation"
-      && !item.amends && !getOpenChannelCard(db, item.objectKey) && this.smartModelNow() !== null;
+      && (!item.amends || reopen !== null) && !getOpenChannelCard(db, item.objectKey) && this.smartModelNow() !== null;
     if (deferCard) payload.cardPending = { delivery: decision!.mode, replyTarget: item.replyTarget, at: at.toISOString() };
     const { event, inserted } = appendEvent(db, {
       source: adapter.id,
@@ -906,24 +912,60 @@ export class ChannelHub {
     const rejudge = { kind: "rejudge" as const, queued: null };
     if (!item.messageId) return rejudge;
     try {
-      const head = this.db.prepare(
-        `SELECT seq FROM events
-         WHERE source = ? AND entity_key = ? AND json_valid(payload) AND json_extract(payload, '$.role') = 'message'
-           AND json_extract(payload, '$.messageId') = ?
-           AND (json_extract(payload, '$.amends') IS NULL OR json_extract(payload, '$.editMerge') = 'rejudge')
-         ORDER BY seq DESC LIMIT 1`,
-      ).get(source, item.objectKey, item.messageId) as { seq: number } | undefined;
-      if (!head) return rejudge;
+      const headSeq = this.judgedHeadSeq(source, item);
+      if (headSeq === undefined) return rejudge;
       const latest = this.latestMessageEvent(item.objectKey, item.messageId);
       const kind = editMergeOf({
         // 判断完了、还在拼上下文包（还没有消息事件）的，也算还在判断：编辑并进去，记消息事件时用改后的话。
-        judged: this.intakeOf(source, head.seq) !== null && !this.packing.has(head.seq),
+        judged: this.intakeOf(source, headSeq) !== null && !this.packing.has(headSeq),
         latest: latest ? { queued: latest.disposition === null && !this.messageTaken(latest.seq) } : null,
       });
       return { kind, queued: kind === "merge_queued" ? latest ?? null : null };
     } catch (error) {
       this.log(`[channels] ${source}: could not tell how to merge an edit in ${item.objectKey}: ${errorText(error)}`);
       return rejudge;
+    }
+  }
+
+  // 这条消息判断的那一条：原来的消息，或者按新消息再判断的那次编辑（最近的一次）。
+  private judgedHeadSeq(source: string, item: ChannelInbound): number | undefined {
+    const row = this.db.prepare(
+      `SELECT seq FROM events
+       WHERE source = ? AND entity_key = ? AND json_valid(payload) AND json_extract(payload, '$.role') = 'message'
+         AND json_extract(payload, '$.messageId') = ?
+         AND (json_extract(payload, '$.amends') IS NULL OR json_extract(payload, '$.editMerge') = 'rejudge')
+       ORDER BY seq DESC LIMIT 1`,
+    ).get(source, item.objectKey, item.messageId) as { seq: number } | undefined;
+    return row?.seq;
+  }
+
+  /**
+   * 一次编辑要不要当新消息再判断：助手按旧的话判断过「不用回」（没开卡、没交给 Lead），现在话变了一大半，
+   * 用户没有在这个对话里回复过，这条消息重开不到 REOPEN_LIMIT 次，编辑是新的。返回被改的那条判断的事件编号，不重开时是 null。
+   * 用户点了忽略、Lead 处理过的消息处置不是助手的 no_action，不会重开；这个对话有开着的卡时编辑照旧更新卡。
+   */
+  private reopenOf(source: string, item: ChannelInbound): number | null {
+    if (item.amends !== "edited" || item.role !== "message" || !item.messageId) return null;
+    try {
+      if (getOpenChannelCard(this.db, item.objectKey)) return null;
+      if (this.now().getTime() - Date.parse(item.occurredAt) > REOPEN_MAX_AGE_MS) return null;
+      const seq = this.judgedHeadSeq(source, item);
+      const head = seq === undefined ? undefined : getEvent(this.db, seq);
+      if (!head || head.disposition !== "no_action" || head.dispositionDetail?.by !== "assistant") return null;
+      if (!materialEdit(typeof head.payload.text === "string" ? head.payload.text : "", item.text)) return null;
+      const answered = this.db.prepare(
+        `SELECT 1 FROM events WHERE source = ? AND entity_key = ? AND seq > ? AND json_valid(payload)
+           AND json_extract(payload, '$.role') IN ('self_reply', 'echo') LIMIT 1`,
+      ).get(source, item.objectKey, head.seq);
+      if (answered) return null;
+      const { n } = this.db.prepare(
+        `SELECT COUNT(*) AS n FROM events WHERE source = ? AND entity_key = ? AND json_valid(payload)
+           AND json_extract(payload, '$.messageId') = ? AND json_extract(payload, '$.reopen') = 1`,
+      ).get(source, item.objectKey, item.messageId) as { n: number };
+      return n < REOPEN_LIMIT ? head.seq : null;
+    } catch (error) {
+      this.log(`[channels] ${source}: could not tell whether to judge an edit in ${item.objectKey} again: ${errorText(error)}`);
+      return null;
     }
   }
 
