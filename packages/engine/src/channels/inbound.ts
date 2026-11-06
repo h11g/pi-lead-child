@@ -113,18 +113,19 @@ export function mergeEdit(queued: MessageReceivedPayload, edit: { seq: number; t
 
 /** 重开只对新鲜的编辑：补拉到的历史编辑不重开，免得旧数据变成一批新卡。 */
 export const REOPEN_MAX_AGE_MS = 60 * 60_000;
-/** 占位消息都很短：超过这个长度的话不当占位（认不出时保守，不重开）。 */
-const PLACEHOLDER_MAX_CHARS = 200;
-// 结尾是省略号（可以跟着 emoji 短代码，例如「… :hourglass:」）。
-const TRAILING_ELLIPSIS = /(?:…|⋯|\.{3,}|。{3,})(?:\s|:[a-z0-9_+-]+:)*$/i;
+// 助手署名的「正在处理」：一行，开头可以有来源加的标记（emoji 短代码），然后是「<助手名> (Assistant) is <动作>…」。
+// 这是 disclosure.ts 的 handlingNotice 的格式（本系统和照同一个署名规矩的助手都这样写），所以认的是格式，不是某一句话。
+// 来源：发信人用的是用户的账号时 sender.bot 是空的（Slack 的 bot_id 才会设它），所以认不了 bot_id；机器人（bot_id）发的消息按
+// channel.slack.delivery 只记录，到不了重开这一步。
+const ASSISTANT_PLACEHOLDER = /^(?::[\w+-]+:\s*)*[^\n]{1,60}?\s\(Assistant\) is [^\n…]{1,60}(?:…|\.{3})$/;
 
 /**
- * 这句话是不是占位（「正在看…」「Thinking...」）：短，并且以省略号结尾，表示正文还在路上。
- * 不看具体的词，认不出的话一律不算占位。
+ * 这句话是不是助手的占位（「Fairy (Assistant) is reviewing…」）：助手署名格式的「正在处理」，以省略号结尾，表示正文还在路上。
+ * 人写的话，包括人写的省略号短句（「这个我再确认一下…」），不算；认不出的话一律不算（保守，不重开）。
+ * 局限：人手敲出同样格式的话会被当成占位；助手不照这个署名格式写时认不出，也就不会重开。
  */
 export function isPlaceholderText(text: string): boolean {
-  const trimmed = text.trim();
-  return trimmed.length > 0 && trimmed.length <= PLACEHOLDER_MAX_CHARS && TRAILING_ELLIPSIS.test(trimmed);
+  return ASSISTANT_PLACEHOLDER.test(text.trim());
 }
 
 /** 改动是不是大到要重新判断（决策边界，纯函数）：长度变化大，或者开头和结尾没变的部分不到旧的话的一半。改错字不算。 */
@@ -142,7 +143,7 @@ export function materialEdit(previous: string, next: string): boolean {
 
 /**
  * 占位变成了正文（决策边界，纯函数）：判断「不用回」时的话是占位，现在的话不再是占位，并且实质变了。
- * 占位换成另一个占位（进度更新）、普通消息的实质修改都不算：它们的编辑照旧只记录（维护者规则 1）。
+ * 占位换成另一个占位（进度更新）、普通消息（包括人写的省略号短句）的实质修改都不算：它们的编辑照旧只记录（维护者规则 1）。
  */
 export function placeholderBecameText(judged: string, latest: string): boolean {
   return isPlaceholderText(judged) && !isPlaceholderText(latest) && materialEdit(judged, latest);

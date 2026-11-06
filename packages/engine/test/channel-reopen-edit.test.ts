@@ -24,7 +24,8 @@ afterEach(async () => {
   db.close();
 });
 
-const PLACEHOLDER = ":robot: Review bot is reviewing…";
+// The assistant disclosure byline of a "handling" notice (disclosure.ts handlingNotice), as the real case posted it.
+const PLACEHOLDER = ":robot: Review bot (Assistant) is reviewing…";
 const BODY = ":robot: Review bot looked at #123 and found no blocking issue. One step is left: please send the link of the 1.1.2 changelog so the header fix can be checked.";
 
 // The reply is judged needed only when the text is not the placeholder and not a pure remark.
@@ -111,9 +112,10 @@ describe("an edit that turns a no-reply placeholder into the real text", () => {
   });
 
   it.each([
-    ["Thinking...", "Thinking... "],
-    ["Working on it… :hourglass:", "Working on it…"],
-  ])("recognises %j as a placeholder, not only one fixed sentence", async (placeholder) => {
+    [":fairy-zz: Fairy (Assistant) is reviewing…"],
+    ["Paimon (Assistant) is working on this…"],
+    ["Review bot (Assistant) is checking..."],
+  ])("recognises %j as an assistant placeholder, not only one fixed sentence", async (placeholder) => {
     const { hub } = setup((first) => (isPlaceholderText(first) ? 0.05 : 0.9));
     const dm = slack.dm("U0FAIRY", placeholder);
     await hub.receive("slack", dm);
@@ -121,6 +123,35 @@ describe("an edit that turns a no-reply placeholder into the real text", () => {
     const edited = (await hub.receive("slack", slack.edit(dm, BODY))).items[0]!;
     await hub.idle();
     expect(getChannelCard(db, cardIdOf(db, edited)!)).toMatchObject({ state: "open" });
+  });
+
+  it("does not reopen a short sentence that a person ended with an ellipsis and later turned into a request", async () => {
+    const { hub, model } = setup(() => 0.05);
+    const dm = slack.dm("U0FAIRY", "这个我再确认一下…");
+    await hub.receive("slack", dm);
+    await hub.idle();
+    const calls = model.calls.length;
+    const edited = (await hub.receive("slack", slack.edit(dm, "这个我确认过了。能帮我看一下 #123 的 CI 为什么挂了吗？日志在构建页面上，麻烦今天内回复我。"))).items[0]!;
+    await hub.idle();
+    expect(edited).toMatchObject({ delivery: "record", cardId: null });
+    expect(listChannelCardsForObject(db, edited.objectKey)).toEqual([]);
+    expect(model.calls.length).toBe(calls);
+  });
+
+  it("does not reopen a message that Lead already settled when its placeholder is edited into the real text", async () => {
+    const { hub, model } = leadHub({ asks: true });
+    const dm = slack.dm("U0FAIRY", PLACEHOLDER);
+    const head = (await hub.receive("slack", dm)).items[0]!;
+    await hub.idle();
+    await hub.leadDisposed(messageEvents()[0]!.seq, { disposition: "no_action", reason: "nothing to answer yet" });
+    const calls = intakeCalls(model);
+    const edited = (await hub.receive("slack", slack.edit(dm, BODY))).items[0]!;
+    await hub.idle();
+    expect(edited).toMatchObject({ delivery: "record" });
+    expect(getEvent(db, edited.seq!)!.payload).not.toHaveProperty("reopen");
+    expect(intakeCalls(model)).toBe(calls);
+    expect(messageEvents()).toHaveLength(1);
+    expect(listChannelCardsForObject(db, head.objectKey).every((card) => card.state !== "open")).toBe(true);
   });
 
   it("does not reopen an ordinary message whose edit is a big change, which stays recorded only", async () => {
@@ -142,7 +173,7 @@ describe("an edit that turns a no-reply placeholder into the real text", () => {
     await hub.receive("slack", dm);
     await hub.idle();
     const calls = model.calls.length;
-    const edited = (await hub.receive("slack", slack.edit(dm, ":robot: Review bot is reviewing the 3 changed files and the lockfile, about half way…"))).items[0]!;
+    const edited = (await hub.receive("slack", slack.edit(dm, ":robot: Review bot (Assistant) is reviewing the changed files, half way…"))).items[0]!;
     await hub.idle();
     expect(edited).toMatchObject({ delivery: "record", cardId: null });
     expect(model.calls.length).toBe(calls);
@@ -160,8 +191,8 @@ describe("an edit that turns a no-reply placeholder into the real text", () => {
 
 // The same hub with Lead connected (as in the daemon), so the message event that Lead receives can be checked. The model can be
 // held while it judges the placeholder: the edit then arrives before the first judgement is done.
-function leadHub(options: { trusted?: string[]; hold?: boolean; urgent?: boolean } = {}) {
-  const base = scriptedSmartModel({ answers: { needs_reply: (state) => placeholderJudged(state.split("\n\n")[0] ?? "") } });
+function leadHub(options: { trusted?: string[]; hold?: boolean; urgent?: boolean; asks?: boolean } = {}) {
+  const base = scriptedSmartModel({ answers: { needs_reply: (state) => (options.asks ? 0.9 : placeholderJudged(state.split("\n\n")[0] ?? "")) } });
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   let heldOnce = false;
@@ -281,24 +312,26 @@ describe("an edit that reopens a skipped message follows the normal delivery and
 
 describe("how a placeholder is told from a text (inbound.ts, the decision boundary)", () => {
   it.each([
-    ["Fairy is reviewing…", true],
-    ["Thinking...", true],
-    ["Working on it… :hourglass:", true],
-    ["正在处理中……", true],
-    ["谢谢", false],
-    ["Please review… when you have time, the link is below", false],
+    [":fairy-zz: Fairy (Assistant) is reviewing…", true],
+    ["Paimon (Assistant) is working on this…", true],
+    ["Review bot (Assistant) is checking...", true],
+    ["这个我再确认一下…", false],
+    ["Thinking...", false],
+    ["能帮我看下 CI 吗…", false],
+    ["Fairy (Assistant) · auto-reply for Dave\nI looked at #123…", false],
+    ["Fairy (Assistant) is reviewing", false],
+    ["Fairy is reviewing…", false],
     ["", false],
-    [`${"long ".repeat(60)}…`, false],
   ])("isPlaceholderText(%j) is %s", (text, expected) => {
     expect(isPlaceholderText(text)).toBe(expected);
   });
 
   it.each([
-    ["Fairy is reviewing…", BODY, true],
-    ["Fairy is reviewing…", "Fairy is reviewing the files, half way…", false],
-    ["Fairy is reviewing…", "Fairy is reviewing", false],
-    ["谢谢", "谢谢，另外能帮我看一下 CI 吗？日志在构建页面上，我这边复现不了。", false],
-    ["Thinking...", "Thinking... ok", false],
+    [PLACEHOLDER, BODY, true],
+    [PLACEHOLDER, ":robot: Review bot (Assistant) is reviewing the changed files, half way…", false],
+    [PLACEHOLDER, ":robot: Review bot (Assistant) is reviewing", false],
+    ["这个我再确认一下…", "这个我确认过了。能帮我看一下 CI 为什么挂了吗？日志在构建页面上，麻烦今天内回复。", false],
+    ["Thinking...", BODY, false],
   ])("placeholderBecameText(%j -> %j) is %s", (judged, latest, expected) => {
     expect(placeholderBecameText(judged, latest)).toBe(expected);
   });
