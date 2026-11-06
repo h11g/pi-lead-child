@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { tempDir } from "@pi-lead-child/core/testing";
 import { getChannelCard, getEvent, listChannelCardsForObject, listEvents, openDb, type Db } from "@pi-lead-child/store";
-import { ChannelHub, ChannelRegistry, createSlackChannelAdapter } from "../src/index.js";
-import { cardIdOf, FakeSlack, scriptedSmartModel } from "../testing/index.js";
+import { MESSAGE_EVENT_KIND } from "@pi-lead-child/protocol";
+import { ChannelHub, ChannelRegistry, createSlackChannelAdapter, type SmartModel } from "../src/index.js";
+import { cardIdOf, FakeAgentTaskDispatcher, FakeSlack, scriptedSmartModel } from "../testing/index.js";
 
 let db: Db;
 let slack: FakeSlack;
@@ -118,5 +119,115 @@ describe("an edit that turns a no-reply placeholder into the real text", () => {
     await hub.idle();
     const removed = (await hub.receive("slack", slack.remove(dm))).items[0]!;
     expect(removed).toMatchObject({ kind: "slack.message.deleted", delivery: "record", cardId: null });
+  });
+});
+
+// The same hub with Lead connected (as in the daemon), so the message event that Lead receives can be checked. The model can be
+// held while it judges the placeholder: the edit then arrives before the first judgement is done.
+function leadHub(options: { trusted?: string[]; hold?: boolean; urgent?: boolean } = {}) {
+  const base = scriptedSmartModel({ answers: { needs_reply: (state) => placeholderJudged(state.split("\n\n")[0] ?? "") } });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let heldOnce = false;
+  const calls: Array<{ purpose?: string }> = [];
+  const model: SmartModel = {
+    ...base,
+    decide: async (state, questions, opts) => {
+      calls.push({ purpose: opts?.purpose });
+      if (opts?.purpose === "channel_urgency") {
+        const probability = options.urgent && state.includes("looked at #123") ? 0.95 : 0.05;
+        const answers = Object.fromEntries(Object.keys(questions).map((name) => [name, { type: "yes_no", probability }]));
+        return { answers: answers as never, backend: "fake-jev", model: null, latencyMs: 1, fallbackFrom: null };
+      }
+      if (options.hold && !heldOnce && opts?.purpose === "channel_intake") {
+        heldOnce = true;
+        await gate;
+      }
+      return base.decide(state, questions, opts);
+    },
+  };
+  const pushes: Array<{ cardId: number }> = [];
+  const dispatcher = new FakeAgentTaskDispatcher(db, {});
+  const hub = new ChannelHub({
+    db, registry: new ChannelRegistry([createSlackChannelAdapter({ api: slack.api, now: () => clock, trust: { trusted: options.trusted ?? [] } })]),
+    credentials: { credential: async () => slack.credential }, now: () => clock, smartModel: () => model, classifyTimeoutMs: 60_000, audit: { rate: 0 },
+    push: (notice) => pushes.push(notice), lead: { dispatcher, available: () => true, taken: () => false },
+  });
+  dispatcher.hub = hub;
+  hubs.push(hub);
+  return { hub, model: { calls }, release, pushes };
+}
+
+const messageEvents = () => listEvents(db, { kind: MESSAGE_EVENT_KIND });
+const intakeCalls = (model: { calls: Array<{ purpose?: string }> }) => model.calls.filter((call) => call.purpose === "channel_intake").length;
+
+describe("an edit that arrives while the first judgement is still running", () => {
+  it("is judged again on the latest text instead of being lost, with one card and one message event for Lead", async () => {
+    const { hub, model, release } = leadHub({ hold: true });
+    const dm = slack.dm("U0FAIRY", PLACEHOLDER);
+    const head = (await hub.receive("slack", dm)).items[0]!;
+    await expect.poll(() => intakeCalls(model)).toBe(1);
+    await hub.receive("slack", slack.edit(dm, BODY));
+    release();
+    await hub.idle();
+    expect(getEvent(db, head.seq!)!.disposition).not.toBe("no_action");
+    expect(listEvents(db, { kind: "channel.reply.not_needed" })).toEqual([]);
+    expect(intakeCalls(model)).toBe(2);
+    expect(getChannelCard(db, cardIdOf(db, head)!)).toMatchObject({ state: "open", excerpt: BODY });
+    expect(messageEvents().map((event) => event.payload.text)).toEqual([BODY]);
+  });
+
+  it("does not judge again for a typo fix", async () => {
+    const { hub, model, release } = leadHub({ hold: true });
+    const text = "各种连招好多。我等客户端它们优化好了。弄不动了 :facepalm:";
+    const dm = slack.dm("U0FAIRY", text);
+    await hub.receive("slack", dm);
+    await expect.poll(() => intakeCalls(model)).toBe(1);
+    await hub.receive("slack", slack.edit(dm, text.replace("优化好了", "优化好啦")));
+    release();
+    await hub.idle();
+    expect(intakeCalls(model)).toBe(1);
+  });
+
+  it("does not open a second card or send Lead a second message when Slack delivers the same edit again", async () => {
+    const { hub, release } = leadHub({ hold: true });
+    const dm = slack.dm("U0FAIRY", PLACEHOLDER);
+    await hub.receive("slack", dm);
+    const edit = slack.edit(dm, BODY);
+    await hub.receive("slack", edit);
+    await hub.receive("slack", slack.redeliver(edit));
+    release();
+    await hub.idle();
+    await hub.receive("slack", slack.redeliver(edit));
+    await hub.idle();
+    expect(listEvents(db, { kind: "slack.message.edited" })).toHaveLength(1);
+    expect(messageEvents()).toHaveLength(1);
+    expect(listChannelCardsForObject(db, "slack:D0FAIRY:main")).toHaveLength(1);
+  });
+});
+
+describe("an edit that reopens a skipped message follows the normal delivery and urgency rules", () => {
+  it("asks how urgent the new text is and pushes like a new direct message from a trusted sender", async () => {
+    const { hub } = leadHub({ trusted: ["U0FAIRY"], urgent: true });
+    const dm = slack.dm("U0FAIRY", PLACEHOLDER);
+    await hub.receive("slack", dm);
+    await hub.idle();
+    const edited = (await hub.receive("slack", slack.edit(dm, BODY))).items[0]!;
+    await hub.idle();
+    expect(edited.delivery).toBe("push_card");
+    expect(getEvent(db, edited.seq!)!.payload).toMatchObject({ urgent: true, reopen: true });
+    // With Lead connected the card is pushed when Lead decides to tell the user; the card carries the delivery mode.
+    expect(getChannelCard(db, cardIdOf(db, edited)!)).toMatchObject({ state: "open", delivery: "push_card" });
+  });
+
+  it("does not push when the new text is not urgent", async () => {
+    const { hub, pushes } = leadHub({ trusted: ["U0FAIRY"], urgent: false });
+    const dm = slack.dm("U0FAIRY", PLACEHOLDER);
+    await hub.receive("slack", dm);
+    await hub.idle();
+    const edited = (await hub.receive("slack", slack.edit(dm, BODY))).items[0]!;
+    await hub.idle();
+    expect(edited.delivery).toBe("card");
+    expect(pushes).toEqual([]);
   });
 });
